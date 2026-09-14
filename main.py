@@ -11,7 +11,7 @@ import sys
 import time
 from datetime import datetime, timezone
 
-from arxiv_fetcher import fetch_recent_papers, rank_papers
+from arxiv_fetcher import fetch_recent_papers, rank_papers, classify_paper
 from paper_downloader import download_papers
 from config import DOWNLOAD_DIR, HISTORY_FILE
 
@@ -38,8 +38,9 @@ def run_once():
         return
 
     for i, p in enumerate(selected, 1):
+        p["category"] = classify_paper(p)
         venue_tag = f" [{p['venue']}]" if p["venue"] else ""
-        print(f"  {i}. {p['title'][:80]}{venue_tag}")
+        print(f"  {i}. [{p['category']}]{venue_tag} {p['title'][:80]}")
 
     # 3. 下载
     print(f"\n[3/3] 开始下载 {len(selected)} 篇论文...")

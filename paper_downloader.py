@@ -1,5 +1,6 @@
 """PDF 下载模块"""
-import hashlib
+import os
+import re
 from pathlib import Path
 
 import requests
@@ -7,6 +8,14 @@ from requests.adapters import HTTPAdapter
 from urllib3.util.retry import Retry
 
 from config import DOWNLOAD_DIR, HISTORY_FILE
+
+# 分类目录名映射
+CATEGORY_DIR_MAP = {
+    "多模态+Agent": "多模态+Agent",
+    "多模态": "多模态",
+    "Agent": "Agent",
+    "其他": "其他",
+}
 
 
 def _load_downloaded_ids() -> set[str]:
@@ -34,6 +43,16 @@ def _make_session() -> requests.Session:
     return session
 
 
+def _sanitize_filename(title: str) -> str:
+    """将论文标题处理为合法的文件名（去掉非法字符、限制长度）"""
+    name = title.strip()
+    name = re.sub(r'[\\/:*?"<>|]', ' ', name)
+    name = re.sub(r'\s+', ' ', name)
+    if len(name) > 80:
+        name = name[:80].rstrip()
+    return name
+
+
 def download_paper(paper: dict) -> Path | None:
     """下载单篇论文 PDF，返回保存路径；若已存在或失败返回 None"""
     arxiv_id = paper["arxiv_id"]
@@ -43,14 +62,17 @@ def download_paper(paper: dict) -> Path | None:
         print(f"  [跳过] {paper['title'][:60]}... (已下载)")
         return None
 
-    # 用论文ID的后8位作文件名，避免路径过长
-    safe_name = f"{arxiv_id.replace('.', '_')}"
-    pdf_path = DOWNLOAD_DIR / f"{safe_name}.pdf"
+    # 按分类子目录存放
+    category_dir = CATEGORY_DIR_MAP.get(paper.get("category", "其他"), "其他")
+    target_dir = DOWNLOAD_DIR / category_dir
+    target_dir.mkdir(parents=True, exist_ok=True)
 
+    file_name = _sanitize_filename(paper["title"])
+    pdf_path = target_dir / f"{file_name}.pdf"
+
+    # 如果标题文件名已存在，追加 arxiv_id 后缀避免冲突
     if pdf_path.exists():
-        _save_downloaded_id(arxiv_id)
-        print(f"  [已存在] {paper['title'][:60]}...")
-        return pdf_path
+        pdf_path = target_dir / f"{file_name}_{arxiv_id.replace('.', '_')}.pdf"
 
     session = _make_session()
     try:
@@ -58,10 +80,9 @@ def download_paper(paper: dict) -> Path | None:
         resp = session.get(paper["pdf_url"], timeout=60)
         resp.raise_for_status()
 
-        DOWNLOAD_DIR.mkdir(parents=True, exist_ok=True)
         pdf_path.write_bytes(resp.content)
         _save_downloaded_id(arxiv_id)
-        print(f"  [完成] 保存到 {pdf_path.name}")
+        print(f"  [完成] 保存到 {category_dir}/{pdf_path.name}")
         return pdf_path
     except requests.RequestException as e:
         print(f"  [失败] {paper['title'][:60]}... {e}")

@@ -179,3 +179,29 @@ def rank_papers(papers: list[dict]) -> list[dict]:
 
     ranked = sorted(papers, key=score, reverse=True)
     return ranked[:DAILY_LIMIT]
+
+
+def classify_paper(paper: dict) -> str:
+    """根据标题和摘要判断论文方向分类"""
+    text = (paper["title"] + " " + paper["summary"]).lower()
+
+    is_multimodal = any(kw in text for kw in [
+        "multimodal", "vision language", "visual language",
+        "image-text", "video-text", "visual grounding",
+        "visual instruction", "vision-and-language",
+    ])
+    is_agent = any(kw in text for kw in [
+        "agent", "tool use", "tool calling", "function calling",
+        "autonomous", "self-reflection", "self-improve",
+        "multi-agent", "agentic", "react", "reasoning agent",
+        "planning agent", "embodied",
+    ])
+
+    if is_multimodal and is_agent:
+        return "多模态+Agent"
+    elif is_multimodal:
+        return "多模态"
+    elif is_agent:
+        return "Agent"
+    else:
+        return "其他"
