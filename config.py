@@ -8,7 +8,7 @@ DOWNLOAD_DIR = Path(r"C:\Users\50464\Desktop\论文\Download")
 HISTORY_FILE = Path(__file__).parent / "downloaded_ids.txt"
 
 # ========== 每日下载数量 ==========
-DAILY_LIMIT = 5
+DAILY_LIMIT = 1
 
 # ========== 搜索关键词（多模态 + Agent 方向）==========
 SEARCH_QUERIES = [

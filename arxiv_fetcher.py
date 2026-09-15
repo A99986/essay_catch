@@ -2,17 +2,50 @@
 import re
 import time
 import random
+import warnings
 from datetime import datetime, timedelta
 
 import requests
+import urllib3
 from bs4 import BeautifulSoup
 
 from config import SEARCH_QUERIES, ARXIV_CATEGORIES, TARGET_VENUES, DAILY_LIMIT
+
+# 抑制 SSL 警告（本地网络环境问题）
+warnings.filterwarnings("ignore", category=urllib3.exceptions.InsecureRequestWarning)
 
 HEADERS = {
     "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
                   "(KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36",
 }
+
+# 知名机构和学者（用于质量加分）
+KNOWN_AUTHORS = {
+    "andrew ng", "yann lecun", "geoffrey hinton", "yoshua bengio", "kaiming he",
+    "fei-fei li", "josh tenenbaum", "pieter abbeel", "sergey levine",
+    "daphne koller", "christopher manning", "dan jurafsky", "zoubin ghahramani",
+    "max welling", "bengio", "lecun", "hinton", "schmidhuber",
+    "demis hassabis", "raia hadsell", "oriol vinyals", "noam shazeer",
+    "ilan sutskever", "alex graves", "jeff dean", "quoc le", "grep b.", "ashish vaswani",
+    "jacob devlin", "ming-wei chang", "percy liang",
+}
+
+KNOWN_INSTITUTIONS = {
+    "google", "deepmind", "google deepmind", "meta ai", "facebook ai", "fair",
+    "openai", "anthropic", "microsoft research", "ibm research",
+    "stanford", "mit", "berkeley", "uc berkeley", "cmu", "carnegie mellon",
+    "oxford", "cambridge", "eth", "epfl",
+    "princeton", "harvard", "caltech", "cornell",
+    "tsinghua", "peking", "beijing", "pku",
+    "ucla", "nyu", "uwashington", "umich", "illinois",
+    "max planck", "inria", "cnrs",
+    "nvidia", "apple", "amazon",
+}
+
+# 作者完整姓名的缓存，避免重复通知
+_notified_authors: set = set()
+
+
 
 
 def _safe_get(url: str, retries: int = 3) -> str | None:
@@ -152,12 +185,44 @@ def fetch_recent_papers() -> list[dict]:
 
 
 def rank_papers(papers: list[dict]) -> list[dict]:
-    """对论文排序：优先推荐目标会议 + 关键词匹配度高的"""
+    """对论文排序：优先推荐目标会议 + 引用数 + 关键词匹配度 + 机构/作者声誉"""
+
+    # 先获取所有候选论文的引用数据
+    enriched = _fetch_citation_counts(papers)
 
     def score(p: dict) -> float:
         s = 0.0
+
+        # 会议接收（最高权重）
         if p["venue"]:
             s += 50
+
+        # 引用数加分
+        citations = p.get("citation_count", 0)
+        if citations >= 50:
+            s += 30
+        elif citations >= 20:
+            s += 20
+        elif citations >= 5:
+            s += 10
+        elif citations >= 1:
+            s += 5
+
+        # 作者声誉加分
+        author_text = " ".join(a.get("name", "") for a in p.get("authors", [])) if isinstance(p.get("authors"), list) and p["authors"] and isinstance(p["authors"][0], dict) else " ".join(p.get("authors", []))
+        author_text = author_text.lower()
+        known_authors_found = [n for n in KNOWN_AUTHORS if n in author_text]
+        if known_authors_found:
+            s += 25
+
+        # 机构声誉加分
+        inst_text = author_text + " " + p.get("summary", "").lower()
+        for inst in KNOWN_INSTITUTIONS:
+            if inst in inst_text:
+                s += 10
+                break
+
+        # 关键词匹配
         text = (p["title"] + " " + p["summary"]).lower()
         keywords = [
             "multimodal", "agent", "vision language", "tool use",
@@ -167,17 +232,16 @@ def rank_papers(papers: list[dict]) -> list[dict]:
             if kw in text:
                 s += 10
 
-        # 多模态+agent 交叉加分
         if "multimodal" in text and "agent" in text:
             s += 20
 
-        # 分类加分
         cat_text = " ".join(p.get("categories", [])).lower()
         if "cs.ai" in cat_text or "cs.cl" in cat_text or "cs.lg" in cat_text:
             s += 5
+
         return s
 
-    ranked = sorted(papers, key=score, reverse=True)
+    ranked = sorted(enriched, key=score, reverse=True)
     return ranked[:DAILY_LIMIT]
 
 
@@ -205,3 +269,50 @@ def classify_paper(paper: dict) -> str:
         return "Agent"
     else:
         return "其他"
+
+
+def _fetch_citation_counts(papers: list[dict]) -> list[dict]:
+    """通过 Semantic Scholar API 批量获取论文引用数"""
+    if not papers:
+        return papers
+
+    arxiv_ids = [p["arxiv_id"] for p in papers]
+    print(f"  查询引用数据（{len(arxiv_ids)} 篇）...")
+
+    url = "https://api.semanticscholar.org/graph/v1/paper/batch"
+    params = {"fields": "citationCount,title,externalIds"}
+
+    id_map = {}
+    for i in range(0, len(arxiv_ids), 50):
+        batch = arxiv_ids[i:i + 50]
+        payload = {"ids": [f"arXiv:{aid}" for aid in batch]}
+        try:
+            time.sleep(1)
+            resp = requests.post(url, json=payload, params=params, timeout=15, verify=False)
+            if resp.status_code == 429:
+                print("    Semantic Scholar 限流，等待 5 秒...")
+                time.sleep(5)
+                resp = requests.post(url, json=payload, params=params, timeout=15, verify=False)
+            if resp.ok:
+                data = resp.json()
+                for entry in data:
+                    if entry is None:
+                        continue
+                    ext_ids = entry.get("externalIds", {}) or {}
+                    aid = ext_ids.get("arXiv", "")
+                    if aid:
+                        id_map[aid] = entry.get("citationCount", 0)
+            else:
+                print(f"    S2 API 返回 {resp.status_code}")
+        except requests.RequestException as e:
+            print(f"    S2 API 请求失败: {e}")
+
+    matched = 0
+    for p in papers:
+        aid = p["arxiv_id"]
+        p["citation_count"] = id_map.get(aid, 0)
+        if p["citation_count"] > 0:
+            matched += 1
+
+    print(f"  引用数据匹配: {matched}/{len(papers)} 篇有引用记录")
+    return papers
