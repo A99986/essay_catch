@@ -11,7 +11,7 @@ import sys
 import time
 from datetime import datetime, timezone
 
-from arxiv_fetcher import fetch_recent_papers, rank_papers, classify_paper
+from arxiv_fetcher import fetch_recent_papers, rank_papers, classify_paper, _fetch_abstracts
 from paper_downloader import download_papers
 from config import DOWNLOAD_DIR, HISTORY_FILE
 
@@ -36,6 +36,11 @@ def run_once():
     if not selected:
         print("  今日暂无新论文")
         return
+
+    # 对精选论文补摘要（用于分类和展示）
+    if not any(p.get("summary") for p in selected):
+        print(f"  获取 {len(selected)} 篇精选论文的摘要...")
+        selected = _fetch_abstracts(selected)
 
     for i, p in enumerate(selected, 1):
         p["category"] = classify_paper(p)

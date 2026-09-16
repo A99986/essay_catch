@@ -1,18 +1,14 @@
-"""arXiv 论文获取模块（基于 HTML 抓取，替代被屏蔽的 API）"""
+"""arXiv 论文获取模块（基于 list 页面分页随机采样 + 摘要补充）"""
 import re
 import time
 import random
-import warnings
-from datetime import datetime, timedelta
+import math
+from datetime import datetime, timedelta, timezone
 
 import requests
-import urllib3
 from bs4 import BeautifulSoup
 
 from config import SEARCH_QUERIES, ARXIV_CATEGORIES, TARGET_VENUES, DAILY_LIMIT
-
-# 抑制 SSL 警告（本地网络环境问题）
-warnings.filterwarnings("ignore", category=urllib3.exceptions.InsecureRequestWarning)
 
 HEADERS = {
     "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
@@ -47,13 +43,13 @@ _notified_authors: set = set()
 
 
 
-
 def _safe_get(url: str, retries: int = 3) -> str | None:
-    """带重试的安全 HTTP GET 请求"""
+    """带重试的安全 HTTP GET 请求，返回纯文本"""
     for attempt in range(retries):
         try:
             time.sleep(random.uniform(0.5, 1.5))
-            resp = requests.get(url, headers=HEADERS, timeout=30)
+            resp = requests.get(url, headers={**HEADERS, "Accept": "text/html,application/xhtml+xml"},
+                                timeout=30)
             if resp.status_code == 429:
                 wait = (attempt + 1) * 8
                 print(f"    被限流，等待 {wait} 秒...")
@@ -73,13 +69,13 @@ def _safe_get(url: str, retries: int = 3) -> str | None:
     return None
 
 
+
 def _parse_list_page(html: str, cat: str) -> list[dict]:
     """解析 arXiv list 页面，提取论文基础信息"""
     soup = BeautifulSoup(html, "lxml")
     dts = soup.find_all("dt")
     dds = soup.find_all("dd")
     papers = []
-    today = datetime.utcnow().strftime("%a, %d %b %Y")
 
     for dt, dd in zip(dts, dds):
         # 提取 arXiv ID
@@ -107,10 +103,9 @@ def _parse_list_page(html: str, cat: str) -> list[dict]:
         categories = []
         if cats_div:
             raw = cats_div.get_text(strip=True)
-            # 提取 cs.AI, cs.CL 等
             categories = re.findall(r"[a-z]+\.[A-Z]{2,}(?:\.[A-Z]{2,})?", raw)
 
-        # 是否有会议标注（在 comments 中）
+        # 是否有会议标注
         comments_div = dd.find("div", class_="list-comments")
         venue = ""
         if comments_div:
@@ -120,14 +115,23 @@ def _parse_list_page(html: str, cat: str) -> list[dict]:
                     venue = v
                     break
 
+        # 从元数据中提取发布日期
+        published = ""
+        meta_div = dd.find("div", class_="list-dateline")
+        if meta_div:
+            meta_text = meta_div.get_text(strip=True)
+            m = re.search(r"Submitted\s+(\d+\s+\w+\s+\d{4})", meta_text)
+            if m:
+                published = m.group(1)
+
         papers.append({
             "arxiv_id": arxiv_id,
             "title": title,
-            "summary": "",  # 稍后通过摘要页面获取
+            "summary": "",     # 稍后只对精选论文补充
             "authors": authors,
             "categories": categories,
-            "published": today,
-            "updated": today,
+            "published": published,
+            "updated": "",
             "venue": venue,
             "pdf_url": f"https://arxiv.org/pdf/{arxiv_id}.pdf",
             "abs_url": f"https://arxiv.org/abs/{arxiv_id}",
@@ -136,8 +140,65 @@ def _parse_list_page(html: str, cat: str) -> list[dict]:
     return papers
 
 
+def _sample_list_pages(cat: str, year: int, sample_count: int = 30) -> list[dict]:
+    """从 arXiv 分类的年份列表页中随机采样 N 页，返回所有论文（不抓摘要）"""
+    # 先获取第一页，找到总页数
+    first_url = f"https://arxiv.org/list/{cat}/{year}?skip=0&show=50"
+    html_text = _safe_get(first_url)
+    if not html_text:
+        return []
+
+    papers = _parse_list_page(html_text, cat)
+
+    # 从导航链接中提取所有 skip 值
+    soup = BeautifulSoup(html_text, "lxml")
+    skip_values = set()
+    for a in soup.find_all("a"):
+        href = a.get("href", "")
+        if f"/list/{cat}/{year}?skip=" in href:
+            try:
+                skip_val = int(href.split("skip=")[1].split("&")[0])
+                skip_values.add(skip_val)
+            except (ValueError, IndexError):
+                pass
+
+    if not skip_values:
+        # 只有一页
+        print(f"    {cat}: 仅1页，共 {len(papers)} 篇")
+        return papers
+
+    max_skip = max(skip_values)
+    total_pages = max_skip // 50 + 1
+    total_estimated = max_skip + 50
+    print(f"    {cat}: 共约 {total_pages} 页 ~{total_estimated} 篇论文")
+
+    # 随机采样 N 页（不包括已抓的第0页）
+    available_pages = list(range(50, max_skip + 50, 50))
+    if sample_count > len(available_pages):
+        sample_count = len(available_pages)
+    sampled_skips = random.sample(available_pages, sample_count)
+
+    papers_by_id: dict[str, dict] = {p["arxiv_id"]: p for p in papers}
+
+    # 抓取采样页面
+    for i, skip in enumerate(sampled_skips):
+        page_url = f"https://arxiv.org/list/{cat}/{year}?skip={skip}&show=50"
+        page_html = _safe_get(page_url)
+        if page_html:
+            page_papers = _parse_list_page(page_html, cat)
+            for p in page_papers:
+                if p["arxiv_id"] not in papers_by_id:
+                    papers_by_id[p["arxiv_id"]] = p
+        if (i + 1) % 10 == 0:
+            print(f"    已采样 {i+1}/{sample_count} 页...")
+
+    result = list(papers_by_id.values())
+    print(f"    {cat}: 采样后共 {len(result)} 篇去重论文")
+    return result
+
+
 def _fetch_abstracts(papers: list[dict]) -> list[dict]:
-    """批量获取论文摘要（通过 abs 页面）"""
+    """批量获取论文摘要"""
     for i, paper in enumerate(papers):
         if i > 0 and i % 5 == 0:
             print(f"    已获取 {i}/{len(papers)} 篇摘要...")
@@ -149,7 +210,6 @@ def _fetch_abstracts(papers: list[dict]) -> list[dict]:
                 abstract_text = blockquote.get_text(strip=True).replace("Abstract:", "", 1).strip()
                 paper["summary"] = abstract_text[:500]
             else:
-                # fallback: mathjax 类
                 abs_div = soup.select_one(".abstract.mathjax")
                 if abs_div:
                     paper["summary"] = abs_div.get_text(strip=True).replace("Abstract:", "", 1).strip()[:500]
@@ -157,72 +217,75 @@ def _fetch_abstracts(papers: list[dict]) -> list[dict]:
     return papers
 
 
-def fetch_recent_papers() -> list[dict]:
-    """从 arXiv list 页面爬取最近论文"""
+def fetch_recent_papers(days_back: int = 180) -> list[dict]:
+    """从 arXiv 近半年的论文列表中随机采样，覆盖 nn 个分类"""
     all_papers: dict[str, dict] = {}
 
-    # 从多个分类抓取
+    # 从今天往前推半年确定年份
+    now = datetime.now(timezone.utc)
+    start_date = now - timedelta(days=days_back)
+    year = start_date.year
+
     categories_to_fetch = ["cs.AI", "cs.CL", "cs.CV", "cs.LG", "cs.MA", "cs.RO"]
     for cat in categories_to_fetch:
-        print(f"  抓取分类 {cat}...")
-        html = _safe_get(f"https://arxiv.org/list/{cat}/recent?skip=0&show=50")
-        if html:
-            papers = _parse_list_page(html, cat)
-            for p in papers:
-                if p["arxiv_id"] not in all_papers:
-                    all_papers[p["arxiv_id"]] = p
-            print(f"    {cat}: 获取 {len(papers)} 篇")
+        print(f"  采样分类 {cat}...")
+        papers = _sample_list_pages(cat, year, sample_count=30)
+        for p in papers:
+            if p["arxiv_id"] not in all_papers:
+                all_papers[p["arxiv_id"]] = p
 
     paper_list = list(all_papers.values())
     print(f"  去重后共 {len(paper_list)} 篇候选论文")
-
-    # 获取摘要（只对最近24小时的论文，避免太多请求）
-    if paper_list:
-        print(f"  获取论文摘要...")
-        paper_list = _fetch_abstracts(paper_list)
-
     return paper_list
 
 
 def rank_papers(papers: list[dict]) -> list[dict]:
-    """对论文排序：优先推荐目标会议 + 引用数 + 关键词匹配度 + 机构/作者声誉"""
+    """对论文排序：高权重给期刊/会议 + 引用数 + 作者/机构声誉 + 关键词匹配"""
 
-    # 先获取所有候选论文的引用数据
+    # 先获取引用数据
     enriched = _fetch_citation_counts(papers)
 
     def score(p: dict) -> float:
         s = 0.0
 
-        # 会议接收（最高权重）
+        # === 期刊/会议接收（最高权重）===
+        # 已接收论文经过同行评审，价值已被验证
         if p["venue"]:
-            s += 50
+            s += 80
 
-        # 引用数加分
+        # === 引用数（加权，体现论文影响力）===
+        # 半年内的论文能积累引用通常说明其价值已被社区认可
         citations = p.get("citation_count", 0)
-        if citations >= 50:
-            s += 30
+        if citations >= 200:
+            s += 80
+        elif citations >= 100:
+            s += 60
+        elif citations >= 50:
+            s += 40
         elif citations >= 20:
-            s += 20
+            s += 25
+        elif citations >= 10:
+            s += 15
         elif citations >= 5:
-            s += 10
+            s += 8
         elif citations >= 1:
-            s += 5
+            s += 3
 
-        # 作者声誉加分
+        # === 作者声誉加分 ===
         author_text = " ".join(a.get("name", "") for a in p.get("authors", [])) if isinstance(p.get("authors"), list) and p["authors"] and isinstance(p["authors"][0], dict) else " ".join(p.get("authors", []))
         author_text = author_text.lower()
         known_authors_found = [n for n in KNOWN_AUTHORS if n in author_text]
         if known_authors_found:
             s += 25
 
-        # 机构声誉加分
+        # === 机构声誉加分 ===
         inst_text = author_text + " " + p.get("summary", "").lower()
         for inst in KNOWN_INSTITUTIONS:
             if inst in inst_text:
                 s += 10
                 break
 
-        # 关键词匹配
+        # === 关键词匹配（突出多模态+Agent交叉方向）===
         text = (p["title"] + " " + p["summary"]).lower()
         keywords = [
             "multimodal", "agent", "vision language", "tool use",
@@ -230,10 +293,10 @@ def rank_papers(papers: list[dict]) -> list[dict]:
         ]
         for kw in keywords:
             if kw in text:
-                s += 10
+                s += 15
 
         if "multimodal" in text and "agent" in text:
-            s += 20
+            s += 40
 
         cat_text = " ".join(p.get("categories", [])).lower()
         if "cs.ai" in cat_text or "cs.cl" in cat_text or "cs.lg" in cat_text:
