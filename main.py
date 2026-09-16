@@ -13,6 +13,7 @@ from datetime import datetime, timezone
 
 from arxiv_fetcher import fetch_recent_papers, rank_papers, classify_paper, _fetch_abstracts
 from paper_downloader import download_papers
+from config import DAILY_LIMIT
 from config import DOWNLOAD_DIR, HISTORY_FILE
 
 
@@ -29,8 +30,8 @@ def run_once():
     papers = fetch_recent_papers()
     print(f"  共获取 {len(papers)} 篇候选论文")
 
-    # 2. 排序精选
-    print(f"\n[2/3] 精选排序，选取前5篇...")
+    # 2. 排序精选（取稍多候选，应对已下载被跳过后仍可凑满5篇）
+    print(f"\n[2/3] 精选排序，选取前20篇...")
     selected = rank_papers(papers)
 
     if not selected:
@@ -47,14 +48,15 @@ def run_once():
         venue_tag = f" [{p['venue']}]" if p["venue"] else ""
         print(f"  {i}. [{p['category']}]{venue_tag} {p['title'][:80]}")
 
-    # 3. 下载
-    print(f"\n[3/3] 开始下载 {len(selected)} 篇论文...")
+    # 3. 逐个下载，跳过已下载，直到凑满 DAILY_LIMIT 篇
+    print(f"\n[3/3] 开始下载（目标 {DAILY_LIMIT} 篇，候选 {len(selected)} 篇）...")
     paths = download_papers(selected)
 
     # 统计
     print(f"\n{'=' * 60}")
-    print(f"今日下载: {len(paths)}/{len(selected)} 篇")
+    print(f"今日下载: {len(paths)}/{DAILY_LIMIT} 篇")
     print(f"历史总计: {len(HISTORY_FILE.read_text(encoding='utf-8').strip().splitlines()) if HISTORY_FILE.exists() else 0} 篇")
+    print(f"{'=' * 60}")
     print(f"{'=' * 60}")
 
 
